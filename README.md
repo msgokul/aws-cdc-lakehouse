@@ -76,6 +76,131 @@ flowchart LR
 | `docs/sprint/` | Day-by-day build runbooks — every console setting and IAM policy, so the build is reproducible by hand |
 | `docs/adr/`, `docs/spikes/` | Decisions, and services designed but not deployed |
 
+## Orchestration and the quality gate
+ 
+```mermaid
+stateDiagram-v2
+    direction TB
+ 
+    [*] --> RunCuratedJob
+ 
+    RunCuratedJob: RunCuratedJob<br/>glue:startJobRun.<b>sync</b><br/>retry ×3 on transient Glue errors
+    RunCuratedJob --> StartDQ: success
+    RunCuratedJob --> NotifyFailure: catch States.ALL
+ 
+    StartDQ: StartDataQualityRun<br/>aws-sdk:glue (no .sync exists)
+    StartDQ --> WaitDQ
+ 
+    WaitDQ: WaitForDataQuality<br/><b>Wait 30s — costs nothing</b>
+    WaitDQ --> GetDQ
+    GetDQ: GetDataQualityRun
+    GetDQ --> IsComplete
+ 
+    IsComplete: Choice on Status
+    IsComplete --> WaitDQ: RUNNING / STARTING
+    IsComplete --> GetResult: SUCCEEDED
+    IsComplete --> NotifyFailure: anything else
+ 
+    GetResult: GetDataQualityResult
+    GetResult --> Gate
+ 
+    Gate: <b>QualityGate</b><br/>Choice on score
+    Gate --> NotifyQualityFailure: score &lt; 1.0
+    Gate --> Validate: score = 1.0
+ 
+    Validate: ValidateCuratedTables — <b>Map</b><br/>per query: StartQueryExecution (async)<br/>→ Wait 10s → GetQueryExecution → Choice
+    Validate --> NotifySuccess
+    Validate --> NotifyFailure: catch
+ 
+    NotifySuccess: SNS — succeeded<br/>score + bytes scanned per validation
+    NotifyQualityFailure: SNS — <b>BLOCKED, bad data</b><br/>names the failed rules
+    NotifyFailure: SNS — pipeline failed<br/>names the state and error
+ 
+    NotifySuccess --> [*]
+    NotifyQualityFailure --> FailGate
+    FailGate: Fail · DataQualityGateFailed
+    NotifyFailure --> FailPipeline
+    FailPipeline: Fail · PipelineFailed
+    FailGate --> [*]
+    FailPipeline --> [*]
+```
+ 
+Two design points worth naming:
+ 
+- **Wait states are free and unbounded.** A Lambda polling the same query would
+  bill for idle time and die at 15 minutes. This is why long-running queries
+  belong behind an async start plus a polling loop.
+- **Bad data and broken code alert differently.** A failed quality gate is not
+  a crash; it produces its own message naming the failing rules, and downstream
+  consumers are deliberately left untouched.
+
+ ## Curated data model
+ 
+```mermaid
+erDiagram
+    DIM_CUSTOMER ||--o{ FACT_ORDER_ITEM : "customer_key"
+    DIM_PRODUCT  ||--o{ FACT_ORDER_ITEM : "product_id"
+    DIM_DATE     ||--o{ FACT_ORDER_ITEM : "date(order_ts)"
+ 
+    DIM_CUSTOMER {
+        string customer_key PK "md5(id + valid_from)"
+        string customer_id "natural key"
+        string customer_city
+        string province
+        string postal_prefix
+        string attr_hash "change detection"
+        timestamp valid_from "SCD2"
+        timestamp valid_to "SCD2 · null = current"
+        boolean is_current "SCD2"
+    }
+ 
+    FACT_ORDER_ITEM {
+        string order_id PK "grain: one order line"
+        int order_item_id PK
+        string customer_key FK "version at order time"
+        string product_id FK
+        string seller_id
+        string order_status
+        timestamp order_ts "partition: months(order_ts)"
+        timestamp delivered_ts
+        timestamp estimated_delivery
+        decimal price
+        decimal freight_value
+        decimal line_total "= price + freight"
+        int delivery_days
+        boolean is_late "delivered past promise"
+        boolean at_risk "undelivered, promise passed"
+    }
+ 
+    DIM_PRODUCT {
+        string product_id PK
+        string category "SCD Type 1"
+        int weight_g
+        bigint volume_cm3
+    }
+ 
+    DIM_DATE {
+        date date_key PK
+        int year
+        int quarter
+        int month
+        string day_name
+        boolean is_weekend
+        string year_month
+    }
+```
+ 
+**Measured:** `fact_order_item` holds **112,650** rows; the composite key
+`(order_id, order_item_id)` has uniqueness **1.0**; `delivered_ts` completeness
+is **97.82%**; prices span **$0.85 – $6,735**.
+ 
+**Why the fact carries `customer_key`, not `customer_id`:** the surrogate key
+points at the *version of the customer that was current when the order
+happened*. If a customer moves province, historical revenue stays attributed to
+where they lived at the time. That is the entire purpose of SCD Type 2 — and
+the reason `dim_customer` carries `valid_from` / `valid_to` / `is_current`
+rather than being overwritten.
+
 ## Security posture
 
 - No credentials in code, job parameters, or config files — **Secrets Manager**
