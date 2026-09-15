@@ -70,10 +70,8 @@ flowchart LR
 | `src/orchestration/` | `maple_daily_pipeline.asl.json` — the state machine |
 | `src/quality/` | `maple_fact_quality.dqdl` — the 13-rule ruleset |
 | `generators/` | `generate_pii.py` (synthetic PII), `profile_data.py` (source profiling) |
-| `scripts/` | `lakeformation_setup.py`, `assume_and_query.py`, `dq_ruleset.py`, `dashboard_data.py`, `aws_inventory.py`, `cost_report.py`, `check_replication_slots.py` |
-| `sql/` | Athena analytics, partition lab, Lake Formation lab, Redshift DDL |
-| `docs/sprint/` | Day-by-day build runbooks — every console setting and IAM policy, so the build is reproducible by hand |
-| `docs/adr/`, `docs/spikes/` | Decisions, and services designed but not deployed |
+| `scripts/` | `lakeformation_setup.py`, `assume_and_query.py`, `dq_ruleset.py`, `dashboard_data.py`, `check_replication_slots.py` |
+| `sql/` | Athena analytics, partition lab, Lake Formation lab|
 
 ## Orchestration and the quality gate
  
