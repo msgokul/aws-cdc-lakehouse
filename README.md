@@ -69,7 +69,6 @@ flowchart LR
 | `src/ingestion/` | `seed_local_oltp.py` — seeds and exercises the OLTP source with psycopg2 |
 | `src/orchestration/` | `maple_daily_pipeline.asl.json` — the state machine |
 | `src/quality/` | `maple_fact_quality.dqdl` — the 13-rule ruleset |
-| `src/security/` | Redaction handlers (Object Lambda + Function URL variants) |
 | `generators/` | `generate_pii.py` (synthetic PII), `profile_data.py` (source profiling) |
 | `scripts/` | `lakeformation_setup.py`, `assume_and_query.py`, `dq_ruleset.py`, `dashboard_data.py`, `aws_inventory.py`, `cost_report.py`, `check_replication_slots.py` |
 | `sql/` | Athena analytics, partition lab, Lake Formation lab, Redshift DDL |
