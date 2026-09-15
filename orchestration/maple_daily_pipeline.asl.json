@@ -1,0 +1,290 @@
+{
+  "Comment": "Maple & Co. daily curated refresh. Demonstrates: Glue .sync integration with retries, Glue Data Quality as a blocking gate, and the async Athena StartQueryExecution + Wait-state polling pattern inside a Map state. Replace <ACCT> with your account id.",
+  "StartAt": "RunCuratedJob",
+  "States": {
+    "RunCuratedJob": {
+      "Comment": "glue:startJobRun.sync -> Step Functions blocks until the job finishes. No Lambda, no polling code, no 15-minute ceiling.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "maple-cleansed-to-curated"
+      },
+      "ResultPath": "$.glueRun",
+      "Retry": [
+        {
+          "Comment": "Transient: another run already in flight, or Glue throttling.",
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ResourceNumberLimitExceededException",
+            "Glue.InternalServiceException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "StartDataQualityRun"
+    },
+
+    "StartDataQualityRun": {
+      "Comment": "AWS SDK integration (no .sync available) -> we start it and poll ourselves.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startDataQualityRulesetEvaluationRun",
+      "Parameters": {
+        "DataSource": {
+          "GlueTable": {
+            "DatabaseName": "maple_curated",
+            "TableName": "fact_order_item"
+          }
+        },
+        "Role": "maple-glue-role",
+        "NumberOfWorkers": 2,
+        "Timeout": 20,
+        "RulesetNames": ["maple-fact-quality"]
+      },
+      "ResultSelector": {
+        "runId.$": "$.RunId"
+      },
+      "ResultPath": "$.dq",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "WaitForDataQuality"
+    },
+
+    "WaitForDataQuality": {
+      "Comment": "A Wait state costs NOTHING while it waits. A Lambda sleeping for the same period bills every millisecond and dies at 15 minutes.",
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetDataQualityRun"
+    },
+
+    "GetDataQualityRun": {
+      "Comment": "No ResultSelector here on purpose: a ResultSelector is applied on EVERY poll, and ResultIds only exists once the run reaches SUCCEEDED. Selecting it while the run is RUNNING fails the state outright. Keep the raw output; read ResultIds later, in the branch that only runs after success.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getDataQualityRulesetEvaluationRun",
+      "Parameters": {
+        "RunId.$": "$.dq.runId"
+      },
+      "ResultPath": "$.dqRun",
+      "Next": "IsDataQualityComplete"
+    },
+
+    "IsDataQualityComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Or": [
+            { "Variable": "$.dqRun.Status", "StringEquals": "STARTING" },
+            { "Variable": "$.dqRun.Status", "StringEquals": "RUNNING" },
+            { "Variable": "$.dqRun.Status", "StringEquals": "STOPPING" }
+          ],
+          "Next": "WaitForDataQuality"
+        },
+        {
+          "Variable": "$.dqRun.Status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "GetDataQualityResult"
+        }
+      ],
+      "Default": "NotifyFailure"
+    },
+
+    "GetDataQualityResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getDataQualityResult",
+      "Parameters": {
+        "ResultId.$": "States.ArrayGetItem($.dqRun.ResultIds, 0)"
+      },
+      "ResultSelector": {
+        "score.$": "$.Score",
+        "ruleResults.$": "$.RuleResults"
+      },
+      "ResultPath": "$.dqResult",
+      "Next": "QualityGate"
+    },
+
+    "QualityGate": {
+      "Comment": "THE GATE. Score is the fraction of rules that passed; anything below 1.0 means a rule failed and the pipeline must stop loudly rather than publish bad data.",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.dqResult.score",
+          "NumericLessThan": 1,
+          "Next": "NotifyQualityFailure"
+        }
+      ],
+      "Default": "ValidateCuratedTables"
+    },
+
+    "ValidateCuratedTables": {
+      "Comment": "Map runs the same async-Athena sub-workflow once per validation query, in parallel.",
+      "Type": "Map",
+      "ItemsPath": "$.validations",
+      "MaxConcurrency": 3,
+      "ItemSelector": {
+        "name.$": "$$.Map.Item.Value.name",
+        "sql.$": "$$.Map.Item.Value.sql"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "StartAthenaQuery",
+        "States": {
+          "StartAthenaQuery": {
+            "Comment": "SDK integration (async). Athena also offers athena:startQueryExecution.sync, but the manual pattern is what you reach for when a job can outlast a Lambda: start, then poll with free Wait states.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:athena:startQueryExecution",
+            "Parameters": {
+              "QueryString.$": "$.sql",
+              "WorkGroup": "maple-wg",
+              "QueryExecutionContext": { "Database": "maple_curated" }
+            },
+            "ResultSelector": {
+              "queryExecutionId.$": "$.QueryExecutionId"
+            },
+            "ResultPath": "$.query",
+            "Retry": [
+              {
+                "ErrorEquals": ["Athena.TooManyRequestsException"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 4,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "WaitForQuery"
+          },
+
+          "WaitForQuery": {
+            "Type": "Wait",
+            "Seconds": 10,
+            "Next": "GetQueryStatus"
+          },
+
+          "GetQueryStatus": {
+            "Comment": "Raw output, no ResultSelector: StateChangeReason and Statistics do not exist while a query is QUEUED/RUNNING, and a ResultSelector referencing a missing field fails the state on the first poll.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:athena:getQueryExecution",
+            "Parameters": {
+              "QueryExecutionId.$": "$.query.queryExecutionId"
+            },
+            "ResultPath": "$.status",
+            "Next": "IsQueryComplete"
+          },
+
+          "IsQueryComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Or": [
+                  { "Variable": "$.status.QueryExecution.Status.State", "StringEquals": "QUEUED" },
+                  { "Variable": "$.status.QueryExecution.Status.State", "StringEquals": "RUNNING" }
+                ],
+                "Next": "WaitForQuery"
+              },
+              {
+                "Variable": "$.status.QueryExecution.Status.State",
+                "StringEquals": "SUCCEEDED",
+                "Next": "QuerySucceeded"
+              }
+            ],
+            "Default": "QueryFailed"
+          },
+
+          "QuerySucceeded": {
+            "Comment": "Statistics are present now that the query has SUCCEEDED, so selecting them here is safe.",
+            "Type": "Pass",
+            "Parameters": {
+              "name.$": "$.name",
+              "queryExecutionId.$": "$.query.queryExecutionId",
+              "scannedBytes.$": "$.status.QueryExecution.Statistics.DataScannedInBytes"
+            },
+            "End": true
+          },
+
+          "QueryFailed": {
+            "Type": "Fail",
+            "Error": "ValidationQueryFailed",
+            "Cause": "An Athena validation query did not reach SUCCEEDED. Check the query execution id in the execution history."
+          }
+        }
+      },
+      "ResultPath": "$.validationResults",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ca-central-1:<ACCT>:maple-pipeline-alerts",
+        "Subject": "Maple pipeline SUCCEEDED",
+        "Message": {
+          "pipeline": "maple-daily-curated",
+          "dataQualityScore.$": "$.dqResult.score",
+          "validations.$": "$.validationResults"
+        }
+      },
+      "End": true
+    },
+
+    "NotifyQualityFailure": {
+      "Comment": "Distinct from a crash: the pipeline worked, the DATA is bad. Different alert, different runbook entry.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ca-central-1:<ACCT>:maple-pipeline-alerts",
+        "Subject": "Maple pipeline BLOCKED - data quality gate failed",
+        "Message": {
+          "pipeline": "maple-daily-curated",
+          "dataQualityScore.$": "$.dqResult.score",
+          "ruleResults.$": "$.dqResult.ruleResults"
+        }
+      },
+      "Next": "FailQualityGate"
+    },
+
+    "FailQualityGate": {
+      "Type": "Fail",
+      "Error": "DataQualityGateFailed",
+      "Cause": "One or more Glue Data Quality rules failed. Downstream consumers were deliberately NOT refreshed."
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ca-central-1:<ACCT>:maple-pipeline-alerts",
+        "Subject": "Maple pipeline FAILED",
+        "Message": {
+          "pipeline": "maple-daily-curated",
+          "error.$": "$.error"
+        }
+      },
+      "Next": "FailPipeline"
+    },
+
+    "FailPipeline": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "See the SNS alert and the execution history for the failing state."
+    }
+  }
+}

@@ -1,0 +1,99 @@
+/*
+ * ===========================================================================
+ * DOCUMENTATION - DO NOT PASTE THIS HEADER INTO THE CONSOLE.
+ * DQDL's grammar does NOT accept comments inside the Rules block; paste only
+ * the "Rules = [ ... ]" block below. (scripts/dq_ruleset.py strips everything
+ * above the word "Rules" automatically, so the file works as-is with it.)
+ * ===========================================================================
+ *
+ * Ruleset: maple-fact-quality      Target: maple_curated.fact_order_item
+ *
+ * What each rule defends against:
+ *   RowCount > 100000            a truncated or half-loaded run
+ *   IsComplete "order_id"        NULL keys - the join would silently drop rows
+ *   IsComplete "order_item_id"   same, second half of the grain
+ *   IsComplete "order_ts"        NULL timestamps break partitioning + windows
+ *   IsComplete "customer_key"    a fact row pointing at no current SCD2 version
+ *                                (this is the rule the Day 5 gate demo breaks)
+ *   IsPrimaryKey                 the declared grain: one row per order line
+ *   ColumnValues "order_status"  a value outside the known domain = upstream drift
+ *   ColumnValues "price"         negative or absurd money
+ *   ColumnValues "freight_value" same
+ *   Completeness "delivered_ts"  most history should be delivered; a sudden drop
+ *                                means the CDC feed or the source changed
+ *   CustomSql                    the derived column must reconcile with its inputs
+ *
+ * -----------------------------------------------------------------------
+ * IF THE API SAYS "DataQuality rules cannot be parsed"
+ * -----------------------------------------------------------------------
+ * Run:  python3 dq_ruleset.py test
+ * It submits each rule ALONE and names the one the parser rejects. Then swap
+ * that rule for its alternate below (same intent, different syntax):
+ *
+ *   IsPrimaryKey "order_id" "order_item_id"
+ *     -> Uniqueness "order_id" "order_item_id" = 1.0
+ *
+ *   CustomSql "SELECT COUNT(*) FROM primary WHERE line_total <> price + freight_value" = 0
+ *     -> CustomSql "SELECT COUNT(*) FROM primary WHERE abs(line_total - price - freight_value) > 0.01" = 0
+ *     (avoids the <> operator inside the quoted SQL)
+ *
+ *   ColumnValues "price" between 0 and 7000
+ *     -> ColumnValues "price" >= 0
+ *
+ * -----------------------------------------------------------------------
+ * WHY THE RANGE RULES USE >= / <= AND NOT between
+ * -----------------------------------------------------------------------
+ * DQDL's `between x and y` is EXCLUSIVE of both bounds. The first run of
+ * this ruleset failed on `ColumnValues "freight_value" between 0 and 1000`
+ * with "Value: 0.0 does not meet the constraint requirement" - because free
+ * shipping (freight_value = 0) is legitimate business data. The rule was
+ * wrong, not the data.
+ *
+ * The lesson that belongs in the runbook: a failing quality rule means
+ * EITHER the data is wrong OR the rule is wrong. Investigate before
+ * "fixing" the data - the naive reaction here would have been to filter out
+ * zero-freight rows, silently deleting every free-shipping order from the
+ * warehouse.
+ *
+ * A minimal block that is known to parse, if you need a green baseline fast:
+ *     Rules = [ RowCount > 100000, IsComplete "order_id", Completeness "delivered_ts" > 0.90 ]
+ *
+ * -----------------------------------------------------------------------
+ * IF THE EDITOR SAYS "token recognition error at: ' '" ON EVERY LINE
+ * -----------------------------------------------------------------------
+ * Check the column number: if it equals the length of that line, the
+ * offender is an invisible CARRIAGE RETURN (Windows CRLF) that came along
+ * with the clipboard. The DQDL lexer rejects \r. Two fixes:
+ *   - paste the whole ruleset as ONE SINGLE LINE (no newlines, no \r), or
+ *   - use scripts/dq_ruleset.py, which normalises \r\n -> \n and flattens
+ *     the block to one line before calling the API.
+ * The single-line form of the full ruleset below is what `dq_ruleset.py
+ * create` submits; run `python3 dq_ruleset.py show` afterwards to see it.
+ *
+ * Optional extra rule to try AFTER the base ruleset saves cleanly (freshness):
+ *     ColumnValues "order_ts" <= now()
+ *
+ * 📝 EXAM: Glue Data Quality is built on DeeQu, and comes in two flavours -
+ * a RULESET evaluated against a catalog table (this file; called by the Step
+ * Functions workflow via StartDataQualityRulesetEvaluationRun), or the
+ * EvaluateDataQuality TRANSFORM inside a Glue ETL job, which can route failing
+ * rows to a quarantine path mid-pipeline. Rule recommendations can be
+ * generated from a table profile and then edited - that is the answer to
+ * "how would you write rules for 200 tables?"
+ */
+
+Rules = [
+    RowCount > 100000,
+    IsComplete "order_id",
+    IsComplete "order_item_id",
+    IsComplete "order_ts",
+    IsComplete "customer_key",
+    IsPrimaryKey "order_id" "order_item_id",
+    ColumnValues "order_status" in ["delivered","shipped","canceled","processing","invoiced","unavailable","approved","created"],
+    ColumnValues "price" >= 0,
+    ColumnValues "price" <= 7000,
+    ColumnValues "freight_value" >= 0,
+    ColumnValues "freight_value" <= 1000,
+    Completeness "delivered_ts" > 0.90,
+    CustomSql "SELECT COUNT(*) FROM primary WHERE line_total <> price + freight_value" = 0
+]
